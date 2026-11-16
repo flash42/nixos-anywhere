@@ -9,3 +9,5 @@ test_key.pub
 errored_test.tfstate
 errored_test.tfstate.backup
 terraform.tfstate
+
+.DS_store
