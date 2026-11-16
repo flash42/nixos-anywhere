@@ -1,0 +1,30 @@
+* Add basic Windows 10 support
+
+** Goal
+
+Make it possible to run Nixos anywhere unattended install on a Windows 10 machine. Cover this case in the test suite.
+
+** Non-goals
+
+- kexec on Windows: architecturally impossible (Linux syscall; Windows kernel offers no equivalent and its Secure Boot/measured-boot model forbids mid-air kernel replacement).
+- Using the NixOS VM test driver (`vm.succeed`, `vm.wait_for_unit`) for the Windows guest. The nix-vm-test framework itself stays for the Linux matrix; upstream Windows support is out of scope.
+- Make it work with Secure Boot. Will come later.
+- No CI pipeline, run locally only
+
+** How the test works
+
+1. Prep windows image with packer from base ISO with SSH enabled.
+2. Boot a Win10 VM from a pinned, preinstalled image.
+3. Assert the guest is up and is the expected Windows 10
+4. Reboot the machine into the NixOS installer environment.
+   1. Terminology: nixos-anywhere's installer artifact is literally named the *kexec-installer* (on Linux it exists to be kexeced into). This pipeline reuses only its payload (kernel + initrd); it is booted through the firmware chain via a one-shot NVRAM boot entry instead of via the kexec syscall, which Windows does not have.
+5. Run nixos-anywhere's disko + install phases against the installer over SSH (unchanged from the Linux flow).
+6. Reboot into the installed NixOS and run final assertions.
+
+
+** Acceptance criteria
+
+- Runs are parallel-safe (each run creates its own overlay; base image is read-only).
+- A failed boot-into-installer step leaves the VM booting Windows (fallback verified by a deliberate failure case).
+- After install, the VM boots into the NixOS `system-to-install` toplevel; disko-created mounts exist; final assertions pass.
+- The Win10 guest is asserted to be the expected OS before staging (version/build via CIM).

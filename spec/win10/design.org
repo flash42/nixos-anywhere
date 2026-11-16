@@ -1,0 +1,192 @@
+* Technical design for Windows 10 support
+
+** Architecture
+
+#+begin_src mermaid :file pipeline.svg
+  flowchart TB
+    subgraph external["External / pinned inputs"]
+        NIXPKGS["nixpkgs<br/>(flake.lock)"]
+        CACHE["image cache<br/>(CI artifact)"]
+        KEXEC["kexec-installer tarball<br/>(nixos-anywhere build)"]
+    end
+
+    subgraph host["Test host — Nix build sandbox (checks.win10-pipeline)"]
+        RUNNER["win10-vm runner<br/>packages.win10-vm"]
+        HARNESS["pytest harness<br/>test logic: setup, exercise, verify"]
+        NA["nixos-anywhere<br/>SUT<br/>phases: handoff, disko, install"]
+        VM["QEMU VM — fixture<br/>(a Windows 10 machine in the field)<br/>identity changes mid-run, see state view"]
+    end
+
+    NIXPKGS -->|QEMU + OVMF| RUNNER
+    CACHE -->|"win10-base.qcow2<br/>pinned by sha256"| RUNNER
+    KEXEC -->|"kernel + initrd payload"| NA
+
+    HARNESS -->|"start / stop,<br/>wait for port"| RUNNER
+    RUNNER -->|"boots: OVMF, KVM,<br/>ephemeral overlay,<br/>hostfwd 2222 → 22"| VM
+
+    HARNESS -->|"invokes<br/>--phases handoff,disko,install"| NA
+    NA -->|"SSH :2222 as Administrator<br/>handoff: payload → ESP,<br/>one-shot NVRAM entry, reboot"| VM
+    NA -->|"SSH :2222 as root<br/>disko + install"| VM
+    HARNESS -.->|"final assertions<br/>over SSH"| VM
+#+end_src
+
+
+#+begin_src mermaid :file lifecycle.svg
+  stateDiagram-v2
+    [*] --> Win10 : runner boots pinned image
+    Win10 --> Installer : handoff phase<br/>(reboot via firmware)
+    Win10 --> Win10 : handoff fails<br/>one-shot entry not consumed,<br/>falls back to Windows
+    Installer --> InstalledNixOS : disko + install + reboot
+    state Win10 {
+        [*] --> bootAsserted
+        bootAsserted --> snapshotted : setup done
+    }
+    InstalledNixOS --> [*] : final assertions pass
+#+end_src
+
+
+- Separate build step builds image from packer template
+  - QEMU builder
+  - OVMF/UEFI firmware
+  - Params: KVM, virtio devices, virtio-win driver ISO, autounattend.xml with OpenSSH enabled and Administrator autologon, ESP sized ≥ 1 GB, no BitLocker, Secure Boot off.
+  - Output: Win10 qcow2 image built by packer
+- win10-vm runner: similar to qemu-win10-nix pattern, but a Nix function whose arguments (image, OVMF, sshPort, memory). Boots the pinned base read-only with an ephemeral qcow2 overlay; `hostfwd 2222 → 22`.
+- New test, duplicating some logic from nix-vm-test:
+  - Wait + assert on Win10 over SSH
+  - boot into installe
+  - wait + assert on the installer
+  - trigger nixos-anywhere
+  - final assertions on installed NixOS.
+- flake outputs: `packages.win10-vm` (runner), `checks.win10-pipeline` (harness, sandboxed in CI).
+- Dependencies to run 
+  - QEMU + OVMF: from nixpkgs via flake.lock
+- Runtime deps: kexec-installer tarball
+
+
+*** Implementation artifacts
+
+1. `packer/win10.pkr.hcl`** + `packer/autounattend/autounattend.xml`: QEMU builder template (OVMF, KVM, virtio-win ISO) with answer file. Output: `win10-base.qcow2`. Done = `packer build` completes unattended and boots to an SSH-reachable desktop-less Win10.
+2. Image pinning + cache: hash manifest (`fetchurl` with sha256, images.json pattern) plus a CI job that builds and publishes the artifact. Done = sandboxed check can start from a prefetched artifact without building Windows.
+3. `flake.nix` additions: `win10-vm` runner function and the concrete call binding image, OVMF, port 2222, memory. Done = `nix build .#win10-vm` yields a runnable derivation; same hash means same VM config.
+4. **`harness/`** (pytest package): `conftest` (SSH client, constants, VM lifecycle fixture), test modules per stage (boot assert, snapshot, boot into installer, installer wait, install, final assert). Done = full pipeline green against the runner, and the boot-into-installer failure case falls back to Windows.
+5. Extend scripts in nixos-anywhere `boot-into-installer.ps1`: the Windows-side script (BitLocker suspend, `mountvol`, payload copy, one-shot NVRAM entry, reboot), invoked by the harness over SSH. Done = idempotent, leaves fallback boot entry when it fails.
+  1. **"No kexec" replacement: one-shot NVRAM boot entry.** The NixOS kexec-installer's kernel is a valid EFI binary (EFI stub). The boot-into-installer step copies it onto the ESP and registers it as the next boot in firmware NVRAM, then reboots. Vanilla `bcdedit` cannot chainload arbitrary `.efi` binaries (it only boots Microsoft-signed boot applications); the entry is created via the firmware environment API (`SetFirmwareEnvironmentVariableEx`, the mechanism EasyUEFI uses). A firmware reboot (\~1 minute) replaces kexec's \~2 seconds; accepted. The old Windows disk stays intact until disko overwrites it deliberately, same guarantee kexec gives on Linux.
+  2. **Installer machine boots Windows 10 target via script:**
+    1. `Suspend-BitLocker -MountPoint C:` if enabled: boot-chain changes alter TPM measurements and trigger a recovery-key prompt, which stalls a headless machine. (In the Packer image BitLocker is simply absent, but the harness should handle it defensively for real-hardware reuse.)
+    2. `mountvol S: /S` to attach the ESP (FAT32; firmware cannot read NTFS).
+    3. Copy the installer kernel + initrd (the payload extracted from the kexec-installer tarball) to the ESP. This is why the image must bake an ESP ≥ 1 GB: the Windows default \~100 MB cannot hold the installer (a whole NixOS userspace in the initrd).
+    4. Create a one-shot NVRAM `Boot####` entry pointing at the installer, ordered so failure falls back to booting Windows rather than stranding the box.
+    5. `shutdown /r`: firmware POST runs, installer boots, SSH into it via the forwarded port.
+
+
+** Key decisions and rationale
+
+1. **Packer builds the Windows image.** Microsoft ships no preinstalled cloud images (unlike Ubuntu/Fedora, which nix-vm-test fetches directly), so the build layer must exist. Packer has first-class Windows support (autounattend answer files, WinRM/SSH communicators) and community templates for Windows 10 on QEMU/KVM.
+2. **Packer artifact is outside the Nix store.** Windows ISOs/images are not redistributable under license, so the image is fetched and pinned like nix-vm-test's `images.json` (URL + sha256), and Packer runs as a separate cached step: the sandboxed `nix flake check` cannot run the Windows install itself.
+3. **pytest over SSH instead of the NixOS test driver.** Windows cannot run the driver's backdoor; the harness polls the forwarded SSH port (replaces `vm.wait_for_unit`) and asserts via PowerShell CIM queries. The pattern already exists in the Linux test: nixos-anywhere is driven by plain `subprocess.run` over SSH there.
+4. Boot into nixos installer (confusingly named kexec-installer)
+
+** Constraints and gotchas
+
+- The Packer build needs KVM to be practical (QEMU without it is too slow).
+- `--post-kexec-ssh-port` has no meaning in the Windows flow; the installer is reached on the same forwarded port.
+- nixos-anywhere phase selection: the Wiprndows flow uses `--store-paths <diskoScriptNoDeps> <toplevel>` against the installer and skips the kexec phase entirely (phases are composable: kexec,disko,install,reboot).
+- ESP space and FAT32 constraints as above; also OVMF in QEMU must be provisioned with Secure Boot off (default state) for v1.
+- No host-side test driver survives the Windows→installer transition; the harness drives everything over TCP, which is why the port forward is a build-time constant.
+
+** Reference implementation (the Linux path to mirror)
+
+The nixos-anywhere repository's `tests/linux-kexec-test.nix` (the origin of this work): boots a target distro via numtide/nix-vm-test, waits for `multi-user.target`, unmasks and starts SSH, forwards host port 2222 to guest 22, then runs, from the host:
+
+```
+nixos-anywhere \
+  --phases kexec \
+  --kexec <kexec-installer> \
+  --store-paths <system-to-install.config.system.build.diskoScriptNoDeps> \
+                 <system-to-install.config.system.build.toplevel> \
+  --ssh-port 2222 root@localhost
+```
+
+then SSHes to the installer and asserts `/etc/os-release` reports NixOS. The Windows pipeline is this flow with (a) the distro boot replaced by the pinned Win10 image + runner, (b) the kexec phase replaced by the boot-into-installer step + firmware reboot, and (c) the driver interaction replaced by the pytest SSH harness. Everything after the installer is up is identical.
+
+** Pseudo code snippets for new suite and implementation
+check
+```
+derivation "win10-pipeline" =
+    inputs: image (sha256-pinned), runner, harness, nixos-anywhere,
+            payload (kernel+initrd from kexec-installer),
+            disko_script, toplevel
+
+    # build script == the test run
+    set env SSH_PORT=2222, SSH_KEY, PAYLOAD, DISKO, TODEMVML
+    runner.start(image)                 # part 2
+    pytest harness/                     # part 3
+    on exit: runner.stop()
+    exit code of pytest
+```
+
+
+runner
+```
+function start(image):
+    overlay = create_qcow2(backing=image, ephemeral)     # base stays read-only
+    exec qemu-system-x86_64 \
+        -enable-kvm -m 4G \
+        -bios OVMF \
+        -drive file=overlay \
+        -nic user,hostfwd=tcp::2222-:22 &
+    # nothing else: no waiting, no asserting — that's the harness's job
+```
+
+harness:    
+```
+function wait_for_ssh(user, timeout=900):
+    until ssh(user@localhost:2222) succeeds or timeout: sleep 5
+    assert reached
+
+# --- setup: stand up the fixture ---
+test boot_assert:
+    wait_for_ssh("administrator")
+    assert powershell("Win32_OperatingSystem").caption == "Microsoft Windows 10"
+    snapshot(CIM: os, disks, services) -> evidence/     # proof of the starting state
+
+# --- exercise: drive the SUT ---
+test install:
+    run on host: nixos-anywhere \
+        --phases handoff,disko,install \
+        --store-paths DISKO TODEMVML \
+        --ssh-port 2222 administrator@localhost         # part 4 runs here
+    assert exit code == 0
+
+# --- verify: the outcome on the fixture ---
+test final_boot:
+    wait_for_ssh("root", timeout=1800)                  # machine reboots into installed NixOS
+    assert os_release VARIANT_ID == "installer" absent   # it's the real system now
+    assert findmnt(disko_mounts) exists
+    assert systemctl is-system-running
+```
+
+
+This is the new feature:
+```
+phase handoff(target):
+    connect over SSH as windows_user                 # e.g. administrator
+    push payload (kernel, initrd) and stage script to target
+    run on target:
+        if bitlocker_enabled(C:): Suspend-BitLocker(C:)     # avoid recovery-key stall
+        mountvol(S:, /S)                                    # attach the ESP (FAT32)
+        copy payload -> S:\nixos-installer\
+        entry = create_boot_entry(                          # firmware env API, not bcdedit
+            efi=S:\nixos-installer\kernel,       # EFI stub, firmware can boot it
+            one_shot=true, next_boot=true)                  # failure => falls back to Windows
+        shutdown /r
+    disconnect
+    wait until port answers again                            # firmware POST ~1 min
+    reconnect over SSH as root                  # now speaking to the NixOS installer
+    # phases disko, install proceed from here, unchanged from the Linux flow
+```
+** Links
+
+- nixos-anywhere repository: [https://github.com/nix-community/nixos-anywhere](https://github.com/nix-community/nixos-anywhere) (docs in docs/reference.md; tests incl. linux-kexec-test.nix and the from-nixos family; terraform modules under terraform/)
+- nix-vm-test: [https://github.com/numtide/nix-vm-test](https://github.com/numtide/nix-vm-test) (images.json pinning pattern, generic backdoor, sandboxed mode)
+- qemu-win10-nix (runner prior art): [https://github.com/michalrus/qemu-win10-nix](https://github.com/michalrus/qemu-win10-nix)
