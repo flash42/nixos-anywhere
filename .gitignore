@@ -11,3 +11,7 @@ errored_test.tfstate.backup
 terraform.tfstate
 
 .DS_store
+
+packer/.iso
+packer/output-win10
+packer/artifacts
