@@ -15,3 +15,4 @@ terraform.tfstate
 packer/.iso
 packer/output-win10
 packer/artifacts
+win10-build/artifacts
