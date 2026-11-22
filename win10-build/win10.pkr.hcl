@@ -46,13 +46,19 @@ source "qemu" "win10" {
 
   shutdown_command = "shutdown /s /t 10 /f"
   vm_name          = "win10-base.qcow2"
-  output_directory = "output-win10"
+  output_directory = "artifacts"
   skip_compaction  = true
 }
 
 build {
   sources = ["source.qemu.win10"]
+
   provisioner "powershell" {
-    inline = ["Get-Service sshd"]   # fails the build if SSH didn't get installed
+    inline = [
+      "$deadline = (Get-Date).AddMinutes(10)",
+      "while (-not (Get-Service sshd -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }",
+      "if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Format-List Name,State; exit 1 }",
+      "Get-Service sshd"
+    ]
   }
 }

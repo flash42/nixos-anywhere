@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
-
-# Build installer with public key
+# prepare-payload.sh — assemble the delivery tree for the dummy.
+# Run inside a build directory; every path is relative to $PWD. Rerunnable:
+# extraction, payload outputs and delivery dir are rebuilt fresh each run
+# (read-only Nix store modes never accumulate), so the cpio append runs
+# exactly once per run.
 #
 # Produces in $PWD:
-#   ./installer-image/         installer installer-image: bzImage, initrd (+pubkey appended),
+#   ./payload/         installer payload: bzImage, initrd (+pubkey appended),
 #                      cmdline.txt, systemd-bootx64.efi
-#   ./delivery/        what the VM receives on drive D::
-#   ./installer-image.sha256   installer identity (4 installer files only,
+#   ./delivery/        the installer staging tree the runner scps into Windows
+#                      and augments with the driver at runtime (run.sh -d):
+#                      delivery/payload/*, delivery/payload.sha256
+#   ./payload.sha256   installer identity (4 installer files only,
+#                      created AFTER the key append)
+#   ./fixture-host-keys/  generated once, reused every run: the installer's
+#                      stable host identity (the restore unit installs these
+#                      into the booted installer's /etc/ssh)
 #   ./tarball.sha256   upstream tarball pin (recorded on first run)
 #
 # Usage:
-#   ./build-installer.sh -k ~/.ssh/id_ed25519.pub -s
+#   ./prepare-payload.sh -k ~/.ssh/id_ed25519.pub
 set -euo pipefail
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 usage() {
   cat <<EOF
-usage: $0 -k <ssh-pubkey> -s <driver.ps1> [-u <tarball-url>]
+usage: $0 -k <ssh-pubkey> [-u <tarball-url>]
   -k  path to the ssh public key appended to the installer initrd (required)
   -u  upstream tarball URL (default: nixos-25.11 noninteractive x86_64)
 EOF
   exit 2
 }
 
-mkdir -p artifacts
-cd artifacts
 URL="https://github.com/nix-community/nixos-images/releases/download/nixos-25.11/nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz"
 PUBKEY=""
 while getopts ":k:u:h" opt; do
@@ -40,14 +47,14 @@ shift $((OPTIND - 1))
 [[ -n "$PUBKEY" ]] || usage
 [[ -s "$PUBKEY" ]] >/dev/null 2>&1 || fail "ssh pubkey not found (or empty): $PUBKEY"
 grep -qE '^(ssh|ecdsa|sk)-[A-Za-z0-9]+ ' "$PUBKEY" || fail "does not look like an ssh public key: $PUBKEY"
-
 command -v cpio >/dev/null || fail "missing dependency: cpio"
+command -v ssh-keygen >/dev/null || fail "missing dependency: ssh-keygen"
 if [[ -z "$PWD" || "$PWD" == "/" || "$PWD" == "$HOME" ]]; then
   fail "refusing to run in '$PWD'; run inside a build directory"
 fi
 [[ -w "$PWD" ]] || fail "no write access to $PWD"
 
-TARBALL="./nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz"
+TARBALL="artifacts/nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz"
 PIN="./tarball.sha256"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -65,56 +72,76 @@ else
 fi
 
 echo "== 2. fresh extraction (dodges the read-only-overwrite wall) =="
-rm -rf kexec
+KEXEC=artifacts/kexec
+rm -rf $KEXEC
 tar xzf "$TARBALL"
-[[ -f kexec/bzImage && -f kexec/initrd && -f kexec/run ]] || fail "tarball did not contain kexec/{bzImage,initrd,run}"
+[[ -f ${KEXEC}/bzImage && -f ${KEXEC}/initrd && -f ${KEXEC}/run ]] || fail "tarball did not contain ${KEXEC}/{bzImage,initrd,run}"
 
 echo "== 3. kernel + cmdline (cmdline verbatim from the tarball's own run script) =="
-mkdir -p installer-image
-rm -f installer-image/*
-cp kexec/bzImage installer-image/bzImage
-init=$(grep '^init=' kexec/run | head -1 | cut -d'"' -f2)
-params=$(grep '^kernelParams=' kexec/run | head -1 | cut -d'"' -f2)
-[[ -n "$init" && -n "$params" ]] || fail "could not extract init/kernelParams from kexec/run"
-printf 'init=%s %s\n' "$init" "$params" > installer-image/cmdline.txt
-echo "   $(cat installer-image/cmdline.txt)"
+mkdir -p payload
+# The Nix store tarball extracts its files read-only (mode 444) and plain cp
+# propagates source modes: the first run CREATES payload/bzImage 444, and any
+# later run's in-place overwrite then dies with Permission denied (truncate
+# needs write permission on the file). Rebuild the per-run outputs fresh
+# instead of truncating stale read-only copies; the chainloader stays cached.
+rm -f payload/bzImage payload/initrd payload/cmdline.txt
+cp ${KEXEC}/bzImage payload/bzImage
+init=$(grep '^init=' ${KEXEC}/run | head -1 | cut -d'"' -f2)
+params=$(grep '^kernelParams=' ${KEXEC}/run | head -1 | cut -d'"' -f2)
+[[ -n "$init" && -n "$params" ]] || fail "could not extract init/kernelParams from ${KEXEC}/run"
+printf 'init=%s %s\n' "$init" "$params" > payload/cmdline.txt
+echo "   $(cat payload/cmdline.txt)"
 
-echo "== 4. initrd + pubkey (upstream kexec-run.sh's own mechanism, writable copy, once) =="
-before=$(stat -c %s kexec/initrd)
-cp kexec/initrd installer-image/initrd
-chmod u+w installer-image/initrd
+echo "== 4. initrd + state (kexec-run.sh's append, mirrored file-for-file) =="
+before=$(stat -c %s ${KEXEC}/initrd)
+cp ${KEXEC}/initrd payload/initrd
+chmod u+w payload/initrd
 mkdir -p "$WORK/ssh"
 cat "$PUBKEY" > "$WORK/ssh/authorized_keys"
-( cd "$WORK" && find . | cpio -o -H newc 2>/dev/null | gzip -9 ) >> installer-image/initrd
-after=$(stat -c %s installer-image/initrd)
+# The installer's restore-state-from-initrd unit runs UNGUARDED globs:
+#   install -m 400 ssh/ssh_host_* /sysroot/etc/ssh
+#   cp *.json /sysroot/root/network/
+# Upstream kexec always ships host keys (harvested from a Linux target) and
+# three `ip --json` dumps, so those globs never go empty there. A Windows
+# origin has neither, so the whole unit would fail and take rw-etc and
+# /sysroot/etc down with it (observed live). Generate fixture host keys and
+# inert jsons to give the globs what upstream's environment always had.
+# Host keys are generated ONCE per build dir and reused, so the installer
+# presents a stable host identity across prep runs (your known_hosts entry
+# for [127.0.0.1]:2222 stays valid); regenerating per run would churn it.
+if [[ ! -s fixture-host-keys/ssh_host_ed25519_key ]]; then
+  mkdir -p fixture-host-keys
+  ssh-keygen -q -t ed25519 -N "" -C win10-nixos-fixture -f fixture-host-keys/ssh_host_ed25519_key
+fi
+cp fixture-host-keys/ssh_host_ed25519_key fixture-host-keys/ssh_host_ed25519_key.pub "$WORK/ssh/"
+printf '{}' > "$WORK/addrs.json"
+printf '{}' > "$WORK/routes-v4.json"
+printf '{}' > "$WORK/routes-v6.json"
+( cd "$WORK" && find . | cpio -o -H newc 2>/dev/null | gzip -9 ) >> payload/initrd
+after=$(stat -c %s payload/initrd)
 (( after > before )) || fail "append failed: initrd did not grow"
 echo "   initrd: $before -> $after bytes (+$((after - before)))"
 
-echo "== 5. chainloader (only nix fetch; cached in ./installer-image afterwards) =="
-if [[ ! -f installer-image/systemd-bootx64.efi ]]; then
+echo "== 5. chainloader (only nix fetch; cached in ./payload afterwards) =="
+if [[ ! -f payload/systemd-bootx64.efi ]]; then
   command -v nix >/dev/null || fail "missing dependency: nix (needed once for systemd-bootx64.efi)"
   nix build nixpkgs#systemd --out-link ./result-systemd
-  cp ./result-systemd/lib/systemd/boot/efi/systemd-bootx64.efi installer-image/
+  cp ./result-systemd/lib/systemd/boot/efi/systemd-bootx64.efi payload/
   rm ./result-systemd
 fi
 
-echo "== 6. delivery disk: installer installer-image (subdir) + driver (root) =="
-rm -rf delivery
-mkdir -p delivery/installer-image
-cp installer-image/bzImage installer-image/initrd installer-image/cmdline.txt installer-image/systemd-bootx64.efi delivery/installer-image/
+echo "== 6. installer identity: checksum only the 4 installer files =="
+( cd payload && sha256sum bzImage initrd cmdline.txt systemd-bootx64.efi ) > ./payload.sha256
+cat ./payload.sha256
 
-echo "== 7. installer identity: checksum"
-( cd installer-image && sha256sum bzImage initrd cmdline.txt systemd-bootx64.efi ) > ./installer-image.sha256
-cat ./installer-image.sha256
+echo "== 7. delivery tree: installer (subdir) + manifest (root) =="
+rm -rf delivery
+mkdir -p delivery/payload
+cp payload/bzImage payload/initrd payload/cmdline.txt payload/systemd-bootx64.efi delivery/payload/
+cp ./payload.sha256 delivery/
 
 echo
 echo "== DONE (build dir: $PWD) =="
 find delivery -type f | sort
 echo
-echo '1) boot the pinned Windows image with the delivery disk attached:'
-echo "     -drive file=fat:rw:$PWD/delivery,format=raw,if=virtio \\"
-echo '     -serial telnet:127.0.0.1:4444,server,nowait'
-echo '2) once Windows is up, trigger (check drive letter via: wmic logicaldisk get name):'
-echo '     ssh -p 2222 Administrator@127.0.0.1 "powershell -ExecutionPolicy Bypass -File D:\boot-into-installer.ps1 -Installer-ImageDir D:\installer-image"'
-echo '3) watch serial:'
-echo '     nc 127.0.0.1 4444'
+echo "next: ./run.sh -b <base.qcow2> -d boot-into-installer.ps1"
