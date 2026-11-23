@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
-# prepare-payload.sh — assemble the delivery tree for the dummy.
+# build-installer.sh — assemble the delivery tree for the dummy.
 # Run inside a build directory; every path is relative to $PWD. Rerunnable:
 # extraction, payload outputs and delivery dir are rebuilt fresh each run
 # (read-only Nix store modes never accumulate), so the cpio append runs
 # exactly once per run.
 #
-# Produces in $PWD:
-#   ./payload/         installer payload: bzImage, initrd (+pubkey appended),
-#                      cmdline.txt, systemd-bootx64.efi
-#   ./delivery/        the installer staging tree the runner scps into Windows
-#                      and augments with the driver at runtime (run.sh -d):
-#                      delivery/payload/*, delivery/payload.sha256
-#   ./payload.sha256   installer identity (4 installer files only,
-#                      created AFTER the key append)
-#   ./fixture-host-keys/  generated once, reused every run: the installer's
-#                      stable host identity (the restore unit installs these
-#                      into the booted installer's /etc/ssh)
-#   ./tarball.sha256   upstream tarball pin (recorded on first run)
+# Produces in $PWD/artifacts:
+#   artifacts/payload/         installer payload: bzImage, initrd (+pubkey appended),
+#                              cmdline.txt, systemd-bootx64.efi
+#   artifacts/delivery/        the installer staging tree the runner scps into Windows
+#                              and augments with the driver at runtime (run.sh -d):
+#                              artifacts/delivery/payload/*, artifacts/delivery/payload.sha256
+#   artifacts/payload.sha256   installer identity (4 installer files only,
+#                              created AFTER the key append)
+#   artifacts/fixture-host-keys/  generated once, reused every run: the installer's
+#                              stable host identity (the restore unit installs these
+#                              into the booted installer's /etc/ssh)
+#   artifacts/tarball.sha256   upstream tarball pin (recorded on first run)
+#
+# Reads from $PWD/artifacts:
+#   artifacts/nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz (downloaded
+#                              on first run if missing)
 #
 # Usage:
-#   ./prepare-payload.sh -k ~/.ssh/id_ed25519.pub
+#   ./build-installer.sh -k ~/.ssh/id_ed25519.pub
 set -euo pipefail
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
@@ -53,9 +57,10 @@ if [[ -z "$PWD" || "$PWD" == "/" || "$PWD" == "$HOME" ]]; then
   fail "refusing to run in '$PWD'; run inside a build directory"
 fi
 [[ -w "$PWD" ]] || fail "no write access to $PWD"
+mkdir -p artifacts
 
 TARBALL="artifacts/nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz"
-PIN="./tarball.sha256"
+PIN="artifacts/tarball.sha256"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -74,28 +79,28 @@ fi
 echo "== 2. fresh extraction (dodges the read-only-overwrite wall) =="
 KEXEC=artifacts/kexec
 rm -rf $KEXEC
-tar xzf "$TARBALL"
+tar xzf "$TARBALL" -C artifacts
 [[ -f ${KEXEC}/bzImage && -f ${KEXEC}/initrd && -f ${KEXEC}/run ]] || fail "tarball did not contain ${KEXEC}/{bzImage,initrd,run}"
 
 echo "== 3. kernel + cmdline (cmdline verbatim from the tarball's own run script) =="
-mkdir -p payload
+mkdir -p artifacts/payload
 # The Nix store tarball extracts its files read-only (mode 444) and plain cp
-# propagates source modes: the first run CREATES payload/bzImage 444, and any
-# later run's in-place overwrite then dies with Permission denied (truncate
-# needs write permission on the file). Rebuild the per-run outputs fresh
-# instead of truncating stale read-only copies; the chainloader stays cached.
-rm -f payload/bzImage payload/initrd payload/cmdline.txt
-cp ${KEXEC}/bzImage payload/bzImage
+# propagates source modes: the first run CREATES artifacts/payload/bzImage 444,
+# and any later run's in-place overwrite then dies with Permission denied
+# (truncate needs write permission on the file). Rebuild the per-run outputs
+# fresh instead of truncating stale read-only copies; the chainloader stays cached.
+rm -f artifacts/payload/bzImage artifacts/payload/initrd artifacts/payload/cmdline.txt
+cp ${KEXEC}/bzImage artifacts/payload/bzImage
 init=$(grep '^init=' ${KEXEC}/run | head -1 | cut -d'"' -f2)
 params=$(grep '^kernelParams=' ${KEXEC}/run | head -1 | cut -d'"' -f2)
 [[ -n "$init" && -n "$params" ]] || fail "could not extract init/kernelParams from ${KEXEC}/run"
-printf 'init=%s %s\n' "$init" "$params" > payload/cmdline.txt
-echo "   $(cat payload/cmdline.txt)"
+printf 'init=%s %s\n' "$init" "$params" > artifacts/payload/cmdline.txt
+echo "   $(cat artifacts/payload/cmdline.txt)"
 
 echo "== 4. initrd + state (kexec-run.sh's append, mirrored file-for-file) =="
 before=$(stat -c %s ${KEXEC}/initrd)
-cp ${KEXEC}/initrd payload/initrd
-chmod u+w payload/initrd
+cp ${KEXEC}/initrd artifacts/payload/initrd
+chmod u+w artifacts/payload/initrd
 mkdir -p "$WORK/ssh"
 cat "$PUBKEY" > "$WORK/ssh/authorized_keys"
 # The installer's restore-state-from-initrd unit runs UNGUARDED globs:
@@ -109,39 +114,39 @@ cat "$PUBKEY" > "$WORK/ssh/authorized_keys"
 # Host keys are generated ONCE per build dir and reused, so the installer
 # presents a stable host identity across prep runs (your known_hosts entry
 # for [127.0.0.1]:2222 stays valid); regenerating per run would churn it.
-if [[ ! -s fixture-host-keys/ssh_host_ed25519_key ]]; then
-  mkdir -p fixture-host-keys
-  ssh-keygen -q -t ed25519 -N "" -C win10-nixos-fixture -f fixture-host-keys/ssh_host_ed25519_key
+if [[ ! -s artifacts/fixture-host-keys/ssh_host_ed25519_key ]]; then
+  mkdir -p artifacts/fixture-host-keys
+  ssh-keygen -q -t ed25519 -N "" -C win10-nixos-fixture -f artifacts/fixture-host-keys/ssh_host_ed25519_key
 fi
-cp fixture-host-keys/ssh_host_ed25519_key fixture-host-keys/ssh_host_ed25519_key.pub "$WORK/ssh/"
+cp artifacts/fixture-host-keys/ssh_host_ed25519_key artifacts/fixture-host-keys/ssh_host_ed25519_key.pub "$WORK/ssh/"
 printf '{}' > "$WORK/addrs.json"
 printf '{}' > "$WORK/routes-v4.json"
 printf '{}' > "$WORK/routes-v6.json"
-( cd "$WORK" && find . | cpio -o -H newc 2>/dev/null | gzip -9 ) >> payload/initrd
-after=$(stat -c %s payload/initrd)
+( cd "$WORK" && find . | cpio -o -H newc 2>/dev/null | gzip -9 ) >> artifacts/payload/initrd
+after=$(stat -c %s artifacts/payload/initrd)
 (( after > before )) || fail "append failed: initrd did not grow"
 echo "   initrd: $before -> $after bytes (+$((after - before)))"
 
-echo "== 5. chainloader (only nix fetch; cached in ./payload afterwards) =="
-if [[ ! -f payload/systemd-bootx64.efi ]]; then
+echo "== 5. chainloader (only nix fetch; cached in artifacts/payload afterwards) =="
+if [[ ! -f artifacts/payload/systemd-bootx64.efi ]]; then
   command -v nix >/dev/null || fail "missing dependency: nix (needed once for systemd-bootx64.efi)"
-  nix build nixpkgs#systemd --out-link ./result-systemd
-  cp ./result-systemd/lib/systemd/boot/efi/systemd-bootx64.efi payload/
-  rm ./result-systemd
+  nix build nixpkgs#systemd --out-link artifacts/result-systemd
+  cp artifacts/result-systemd/lib/systemd/boot/efi/systemd-bootx64.efi artifacts/payload/
+  rm artifacts/result-systemd
 fi
 
 echo "== 6. installer identity: checksum only the 4 installer files =="
-( cd payload && sha256sum bzImage initrd cmdline.txt systemd-bootx64.efi ) > ./payload.sha256
-cat ./payload.sha256
+( cd artifacts/payload && sha256sum bzImage initrd cmdline.txt systemd-bootx64.efi ) > artifacts/payload.sha256
+cat artifacts/payload.sha256
 
 echo "== 7. delivery tree: installer (subdir) + manifest (root) =="
-rm -rf delivery
-mkdir -p delivery/payload
-cp payload/bzImage payload/initrd payload/cmdline.txt payload/systemd-bootx64.efi delivery/payload/
-cp ./payload.sha256 delivery/
+rm -rf artifacts/delivery
+mkdir -p artifacts/delivery/payload
+cp artifacts/payload/bzImage artifacts/payload/initrd artifacts/payload/cmdline.txt artifacts/payload/systemd-bootx64.efi artifacts/delivery/payload/
+cp artifacts/payload.sha256 artifacts/delivery/
 
 echo
 echo "== DONE (build dir: $PWD) =="
-find delivery -type f | sort
+find artifacts/delivery -type f | sort
 echo
-echo "next: ./run.sh -b <base.qcow2> -d boot-into-installer.ps1"
+echo "next: ./run.sh -b artifacts/win10-base-v1.qcow2 -d boot-into-installer.ps1"

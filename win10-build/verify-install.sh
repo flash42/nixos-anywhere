@@ -20,12 +20,12 @@ usage: $0 [-k <identity>] [-p <port>] [-t <timeout-sec>] [-s <result-system>]
   -k  ssh identity (default: ~/.ssh/id_ed25519)
   -p  forwarded ssh port (default: 2222)
   -t  how long to wait for the installed system (default: 900 s)
-  -s  the toplevel 03 built (default: ./result-system)
+  -s  the toplevel 03 built (default: artifacts/result-system)
 EOF
   exit 2
 }
 
-IDENTITY="$HOME/.ssh/id_ed25519" PORT=2222 TIMEOUT=900 SYSTEM="./result-system"
+IDENTITY="$HOME/.ssh/id_ed25519" PORT=2222 TIMEOUT=900 SYSTEM="artifacts/result-system"
 while getopts ":k:p:t:s:h" opt; do
   case "$opt" in
     k) IDENTITY=$OPTARG ;;
@@ -58,7 +58,7 @@ SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectT
 # multiplexing: one key passphrase per script run, not one per iteration of
 # the polling loop; the master socket survives tenant changes (after the
 # reboot the dead socket is taken over by a fresh connection automatically)
-CTRL="-o ControlMaster=auto -o ControlPath=$PWD/.ssh-ctl-%r-%h-%p -o ControlPersist=120"
+CTRL="-o ControlMaster=auto -o ControlPath=$PWD/artifacts/.ssh-ctl-%r-%h-%p -o ControlPersist=120"
 expected=$(readlink -f "$SYSTEM")
 
 echo "== waiting up to $TIMEOUT s for the installed system on port $PORT =="

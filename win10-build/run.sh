@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# run.sh — dummy runtime, counterpart to prepare-payload.sh.
-# Boots the pinned Windows fixture, stages ./delivery (installer staging
-# tree from prepare-payload.sh) plus the driver (-d) over SSH, then triggers
-# boot-into-installer.ps1. The driver is this script's input, not the prep
-# step's: edit the ps1 freely and just rerun, no installer reassembly.
+# run.sh — dummy runtime, counterpart to build-installer.sh.
+# Boots the pinned Windows fixture, stages artifacts/delivery (installer
+# staging tree from build-installer.sh) plus the driver (-d) over SSH, then
+# triggers boot-into-installer.ps1. The driver is this script's input, not
+# the prep step's: edit the ps1 freely and just rerun, no installer reassembly.
 #
-# Per-run state lives in ./run/ (disk overlay + NVRAM copy), fresh each run:
-# the pinned base image and the OVMF template are never written.
+# Per-run state lives in artifacts/run/ (disk overlay + NVRAM copy), fresh
+# each run: the pinned base image and the OVMF template are never written.
 # The VM is left running at the end:
 #   - see the guest screen:     vncviewer 127.0.0.1:5900   (loopback VNC)
-#   - watch the installer boot:  tail -f run/serial.log
-#     (run/serial.log captures ALL serial output from kernel start: a bare
-#      telnet serial drops output while no nc client is attached, the
+#   - watch the installer boot:  tail -f artifacts/run/serial.log
+#     (artifacts/run/serial.log captures ALL serial output from kernel start:
+#      a bare telnet serial drops output while no nc client is attached, the
 #      logfile backend does not; nc on the serial port is still available
 #      for interactive use)
 #   - guest reboots stay inside the same QEMU process (NVRAM persists)
-#   - if QEMU dies, relaunch with the SAME ./run files: run/vars.fd carries
-#     the one-shot BootNext entry; fresh vars would silently boot Windows.
+#   - if QEMU dies, relaunch with the SAME artifacts/run files:
+#     artifacts/run/vars.fd carries the one-shot BootNext entry; fresh vars
+#     would silently boot Windows.
 #
 # Usage:
 #   ./run.sh -b artifacts/win10-base-v1.qcow2 -d boot-into-installer.ps1
@@ -76,7 +77,7 @@ shift $((OPTIND - 1))
 [[ -r "$OVMF_CODE" ]] || fail "OVMF firmware code not found: $OVMF_CODE"
 [[ -r "$OVMF_VARS" ]] || fail "OVMF NVRAM template not found: $OVMF_VARS"
 for f in bzImage initrd cmdline.txt systemd-bootx64.efi; do
-  [[ -s "delivery/payload/$f" ]] || fail "missing ./delivery/payload/$f (run prepare-payload.sh first)"
+  [[ -s "artifacts/delivery/payload/$f" ]] || fail "missing artifacts/delivery/payload/$f (run build-installer.sh first)"
 done
 command -v qemu-system-x86_64 >/dev/null || fail "missing dependency: qemu-system-x86_64"
 command -v qemu-img >/dev/null        || fail "missing dependency: qemu-img"
@@ -89,24 +90,24 @@ BASE=$(realpath "$BASE")   # record absolute path: the overlay resolves its
                            # backing file relative to itself, not to $PWD
 
 # --- per-run state: fresh overlay + fresh NVRAM -------------------------
-mkdir -p run
-rm -f run/overlay.qcow2 run/vars.fd run/qemu.pid
-qemu-img create -f qcow2 -F qcow2 -b "$BASE" run/overlay.qcow2 >/dev/null
-cp "$OVMF_VARS" run/vars.fd
+mkdir -p artifacts/run
+rm -f artifacts/run/overlay.qcow2 artifacts/run/vars.fd artifacts/run/qemu.pid
+qemu-img create -f qcow2 -F qcow2 -b "$BASE" artifacts/run/overlay.qcow2 >/dev/null
+cp "$OVMF_VARS" artifacts/run/vars.fd
 
 # --- boot ---------------------------------------------------------------
 qemu-system-x86_64 \
   -enable-kvm -m "$MEM" -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-  -drive if=pflash,format=raw,file=run/vars.fd \
-  -drive file=run/overlay.qcow2,if=ide,format=qcow2 \
+  -drive if=pflash,format=raw,file=artifacts/run/vars.fd \
+  -drive file=artifacts/run/overlay.qcow2,if=ide,format=qcow2 \
   -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
   -device e1000,netdev=net0 \
-  -chardev socket,id=ser0,host=127.0.0.1,port=${SERIAL_PORT},telnet=on,server=on,wait=off,logfile=run/serial.log \
+  -chardev socket,id=ser0,host=127.0.0.1,port=${SERIAL_PORT},telnet=on,server=on,wait=off,logfile=artifacts/run/serial.log \
   -serial chardev:ser0 \
   -vnc 127.0.0.1:${VNC_DISPLAY} \
-  -display none -daemonize -pidfile run/qemu.pid
-QEMU_PID=$(cat run/qemu.pid)
+  -display none -daemonize -pidfile artifacts/run/qemu.pid
+QEMU_PID=$(cat artifacts/run/qemu.pid)
 trap 'rc=$?; if (( rc != 0 )); then kill "$QEMU_PID" 2>/dev/null || true; fi' EXIT
 
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
@@ -120,8 +121,8 @@ done
 echo "   Windows is up"
 
 # --- stage the delivery tree --------------------------------------------
-echo "== staging delivery/ (installer) + driver over scp =="
-cp "$DRIVER" delivery/boot-into-installer.ps1
+echo "== staging artifacts/delivery/ (installer) + driver over scp =="
+cp "$DRIVER" artifacts/delivery/boot-into-installer.ps1
 sshpass -p "$PASSWORD" ssh $SSHOPTS -p "$SSH_PORT" "$ADMIN@127.0.0.1" \
   "powershell -Command \"if (Test-Path C:/Users/Administrator/delivery) { Remove-Item -Recurse -Force C:/Users/Administrator/delivery }\"" >/dev/null || true
 
@@ -129,9 +130,9 @@ sshpass -p "$PASSWORD" ssh $SSHOPTS -p "$SSH_PORT" "$ADMIN@127.0.0.1" \
 # ~500 MB over QEMU user-mode NAT (minutes). Background it and report the
 # staged byte count from the Windows side instead. A frozen counter means
 # the transfer itself is stalled, not that the script hung.
-DELIVERY_BYTES=$(du -sb delivery | cut -f1)
+DELIVERY_BYTES=$(du -sb artifacts/delivery | cut -f1)
 echo "   pushing $(( DELIVERY_BYTES / 1024 / 1024 )) MB (progress reports below)"
-sshpass -p "$PASSWORD" scp $SSHOPTS -r -P "$SSH_PORT" delivery "$ADMIN@127.0.0.1:C:/Users/Administrator/delivery" &
+sshpass -p "$PASSWORD" scp $SSHOPTS -r -P "$SSH_PORT" artifacts/delivery "$ADMIN@127.0.0.1:C:/Users/Administrator/delivery" &
 SCP_PID=$!
 while kill -0 "$SCP_PID" 2>/dev/null; do
   staged=$(sshpass -p "$PASSWORD" ssh $SSHOPTS -p "$SSH_PORT" "$ADMIN@127.0.0.1" \
@@ -141,7 +142,7 @@ while kill -0 "$SCP_PID" 2>/dev/null; do
   fi
   sleep 15
 done
-wait "$SCP_PID" || fail "scp of delivery/ failed (exit $?)"
+wait "$SCP_PID" || fail "scp of artifacts/delivery/ failed (exit $?)"
 echo "   staged at C:/Users/Administrator/delivery"
 
 # --- trigger -------------------------------------------------------------
@@ -153,8 +154,8 @@ timeout 300 sshpass -p "$PASSWORD" ssh $SSHOPTS -p "$SSH_PORT" "$ADMIN@127.0.0.1
 echo
 echo "== DONE: VM still running (pid $QEMU_PID) =="
 echo "see the screen:            vncviewer 127.0.0.1:$((5900 + VNC_DISPLAY))   (loopback VNC, display $VNC_DISPLAY)"
-echo "watch the installer boot:  tail -f run/serial.log   (full capture from kernel start)"
+echo "watch the installer boot:  tail -f artifacts/run/serial.log   (full capture from kernel start)"
 echo "or interact on serial:     nc 127.0.0.1 $SERIAL_PORT"
 echo "once it is up, the installer answers on the same ssh port with the baked key:"
 echo "  ssh -p $SSH_PORT root@127.0.0.1"
-echo "per-run state: ./run/ (reuse overlay.qcow2 AND vars.fd on any relaunch; vars.fd carries BootNext)"
+echo "per-run state: artifacts/run/ (reuse overlay.qcow2 AND vars.fd on any relaunch; vars.fd carries BootNext)"

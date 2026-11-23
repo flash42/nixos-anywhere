@@ -65,6 +65,7 @@ if [[ -z "$PWD" || "$PWD" == "/" || "$PWD" == "$HOME" ]]; then
   fail "refusing to run in '$PWD'; run inside a build directory"
 fi
 [[ -w "$PWD" ]] || fail "no write access to $PWD"
+mkdir -p artifacts
 
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
 
@@ -75,8 +76,8 @@ fi
 echo "   installer is reachable"
 
 echo "== building target artifacts ($FLAKE # $CONFIG) =="
-nix build "$FLAKE#nixosConfigurations.$CONFIG.config.system.build.diskoScriptNoDeps" -o result-disko
-nix build "$FLAKE#nixosConfigurations.$CONFIG.config.system.build.toplevel" -o result-system
+nix build "$FLAKE#nixosConfigurations.$CONFIG.config.system.build.diskoScriptNoDeps" -o artifacts/result-disko
+nix build "$FLAKE#nixosConfigurations.$CONFIG.config.system.build.toplevel" -o artifacts/result-system
 
 PHASES="disko,install"
 if (( REBOOT )); then PHASES="disko,install,reboot"; fi
@@ -85,7 +86,7 @@ echo "== nixos-anywhere: phases=$PHASES =="
 IFS=" " read -r -a NA <<< "$NA_CMD"
 "${NA[@]}" \
   --phases "$PHASES" \
-  --store-paths "$(realpath result-disko)" "$(realpath result-system)" \
+  --store-paths "$(realpath artifacts/result-disko)" "$(realpath artifacts/result-system)" \
   --ssh-port "$PORT" \
   --ssh-option "IdentityFile=$IDENTITY" \
   --ssh-option "StrictHostKeyChecking=no" \

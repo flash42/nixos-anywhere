@@ -9,7 +9,7 @@ packer {
 
 variable "iso_url" {
   type    = string
-  default = ".iso/Win10_22H2_English_x64v1.iso"
+  default = "artifacts/iso/Win10_22H2_English_x64v1.iso"
 }
 
 variable "iso_checksum" {
@@ -45,7 +45,7 @@ source "qemu" "win10" {
   winrm_timeout  = "2h"
 
   shutdown_command = "shutdown /s /t 10 /f"
-  vm_name          = "win10-base.qcow2"
+  vm_name          = "win10-base-v1.qcow2"
   output_directory = "artifacts"
   skip_compaction  = true
 }
